@@ -11,34 +11,43 @@ from azure.identity import DefaultAzureCredential
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeResult, AnalyzeDocumentRequest
-from azure.storage.blob import BlobServiceClient, ResourceTypes, AccountSasPermissions, generate_account_sas
+from azure.storage.blob import BlobServiceClient, ResourceTypes, AccountSasPermissions, generate_account_sas, BlobClient
 from azure.search.documents import SearchClient  
+import requests
+import json
+import re
  
-# storage_connection_string = os.getenv("azure_storage_connection_string")
-
 # Azure Blob Storage Configuration  
-# BLOB_CONNECTION_STRING = os.getenv("BLOB_CONNECTION_STRING") 
-BLOB_ACCOUNT_NAME = os.getenv("BLOB_ACCT_NAME")
-BLOB_SAS_TOKEN = os.getenv("BLOB_SAS_TOKEN")
+BLOB_CONNECTION_STRING = os.getenv("azure_storage_connection_string")
+BLOB_ACCOUNT_NAME = os.getenv("storage_account")
+BLOB_SAS_TOKEN = os.getenv("sas")
 
-BLOB_CONTAINER_NAME = "sats-wfs"  
-FOLDER_NAME = "parent_folder"
-PDF_BLOB_NAME = "WFS-SATS-PR-28-Sep-2022.pdf" 
+BLOB_CONTAINER_NAME = os.getenv("container_name")  
+FOLDER_NAME = os.getenv("subfolder_name")
+PDF_BLOB_NAME = "1 Administration_1.14 Configure embargoes.pdf" 
   
 # Azure Document Intelligence Configuration  
-DOCUMENT_INTELLIGENCE_ENDPOINT = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")  
-DOCUMENT_INTELLIGENCE_KEY = os.getenv("DOCUMENT_INTELLIGENCE_KEY")  
+DOCUMENT_INTELLIGENCE_ENDPOINT = os.getenv("document_intelligence_endpoint")  
+DOCUMENT_INTELLIGENCE_KEY = os.getenv("document_intelligence_key")  
   
 # Azure Cognitive Search Configuration  
-SEARCH_SERVICE_ENDPOINT = os.getenv("SEARCH_SERVICE_ENDPOINT")  
-SEARCH_API_KEY = os.getenv("SEARCH_API_KEY")  
-SEARCH_INDEX_NAME = "cargospot-codebase-index"  
+SEARCH_SERVICE_ENDPOINT = os.getenv("azure_search_service_endpoint")  
+SEARCH_API_KEY = os.getenv("azure_search_api_key")  
+SEARCH_INDEX_NAME = os.getenv("search_index_name")
  
 # OpenAI Configuration (If using Option 1 or 3)  
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  
+OPENAI_API_KEY = os.getenv("credential")  
   
 # Chunking Configuration  
 MAX_CHUNK_SIZE = 1000  # Maximum number of characters per chunk  
+
+
+# ----------------------- Step 0: listing files that are located in a data lake storage account -----------------------
+def get_list_of_blob_names():
+    blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
+    container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
+    blob_list = container_client.list_blobs(name_starts_with=FOLDER_NAME)
+    return [blob.name for blob in blob_list]
 
 # ----------------------- Step 1: Access PDF from Blob Storage -----------------------  
 def get_blob_sas_url():
@@ -53,92 +62,100 @@ def get_blob_sas_url():
 #     return pdf_content  
 
 # ----------------------- Step 2: Analyze PDF with Document Intelligence ----------------------- 
-def analyze_pdf(blob_path):  
-    client = DocumentIntelligenceClient(  
-        endpoint=DOCUMENT_INTELLIGENCE_ENDPOINT,  
-        credential=AzureKeyCredential(DOCUMENT_INTELLIGENCE_KEY)  
-    )  
-    poller = client.begin_analyze_document("prebuilt-layout", AnalyzeDocumentRequest(url_source=blob_path))  
-    result = poller.result()  
-    return result 
+def analyze_pdf(blob_path):
+    try:   
+        client = DocumentIntelligenceClient(  
+            endpoint=DOCUMENT_INTELLIGENCE_ENDPOINT,  
+            credential=AzureKeyCredential(DOCUMENT_INTELLIGENCE_KEY)  
+        )  
+        poller = client.begin_analyze_document("prebuilt-layout", AnalyzeDocumentRequest(url_source=blob_path))  
+        result = poller.result()  
+        return result
+    except Exception as e:
+        print(f"Error in analyzing PDF: {e}")
+        return None
 
 # ----------------------- Step 3: Extract Text and Images -----------------------  
 
 def extract_images_from_pdf(pdf_bytes):  
     images = []  
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:  
-        for page_num in range(len(doc)):  
-            page = doc.load_page(page_num)  
-            image_list = page.get_images(full=True)  
-            for img_index, img in enumerate(image_list):  
-                xref = img[0]  
-                base_image = doc.extract_image(xref)  
-                image_bytes = base_image["image"]  
-                images.append(image_bytes)  
-    return images 
+    response = requests.get(pdf_bytes)
+    if response.status_code != 200:
+        raise ValueError(f"Failed to download PDF. HTTP Status: {response.status_code}")
+    
+    pdf_bytes = response.content  # Get the PDF content as bytes
 
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            image_list = page.get_images(full=True)
 
-def extract_content(document_analysis_result, pdf_bytes) :  
-    text_content = ""  
-    images = []  
-  
-    # Extract text  
-    for page in document_analysis_result.pages:  
-        for line in page.lines:  
-            text_content += line.content + "\n"  
-    print(text_content)
-    if document_analysis_result.figures:
-        for page_idx, page in enumerate(document_analysis_result.pages):  
-            for image_idx, img in enumerate(page.figures):  
-                if hasattr(img, 'content'):  
-                    # If the image content is directly available  
-                    images.append(img.content)  
-                else:  
-                    print(f"Image data not directly accessible for page {page_idx + 1}, image {image_idx + 1}")  
-            # If no images extracted via SDK, fallback to PDF parsing  
-    # if not images:  
-    #     print("No images extracted via SDK. Attempting to extract images using PyMuPDF...")  
-    #     images = extract_images_from_pdf(pdf_bytes)  
-    #     print(f"Extracted {len(images)} images using PyMuPDF.")    
-    return text_content, images  
+            if not image_list:
+                continue
+
+            for img in image_list:
+                xref = img[0]
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                images.append((page_num, image_bytes))  # Store page number for linking
+
+    return images
+
+def extract_content(document_analysis_result, pdf_bytes):
+    text_content = {}
+    images = extract_images_from_pdf(pdf_bytes)
+
+    # Extract text
+    for page_idx, page in enumerate(document_analysis_result.pages):
+        page_text = "\n".join([line.content for line in page.lines])
+        text_content[page_idx] = page_text  # Store page number for linking
+
+    return text_content, images
   
 # ----------------------- Step 4: Generate Image Summaries -----------------------  
   
 # Option 1: Using LLM to Generate Image Summaries (OpenAI)
 def generate_image_summary_openai(image_bytes):  
     # Convert image bytes to base64 string  
-    image_base64 = base64.b64encode(image_bytes).decode('utf-8')  
+    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+    image_data_uri = f"data:image/png;base64,{image_base64}"
+
     user_prompt = f"Provide a detailed summary for the following image:"  ## Modify prompt as needed
     system_prompt = f"You are an AI assistant that summarizes images based on provided data." ## Modify prompt as needed
     client = AzureOpenAI(
-                api_key = os.getenv("AZURE_OPENAI_API_KEY"),  
-                api_version = "2024-06-01",
-                azure_endpoint =os.getenv("AZURE_OPENAI_ENDPOINT") 
-                )
-    response = client.chat.completions.create(
-            model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_prompt},
-                        {"type": "image_url", "image_url": {"url": image_base64},
-                    },
-                    ],
-                },
-            ],
-            max_tokens=2000,
-            temperature=0.7,
+        api_key = os.getenv("credential"),  
+        api_version = "2024-06-01",
+        azure_endpoint =os.getenv("open_ai_endpoint") 
         )
+    response = client.chat.completions.create(
+        model=os.getenv("open_ai_model_gpt"),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_uri},},
+                ],
+            },
+        ],
+        max_tokens=1000,
+        temperature=0.1,
+    )
 
-    summary = response.choices[0].message['content'].strip()  
-    return summary 
+    return response.choices[0].message.content.strip()  
 
 # Function to choose summarization method  
-def generate_image_summary(image_bytes, option="openai"):  
+def generate_image_summaries(images, option="openai"):  
     if option == "openai":  
-        return generate_image_summary_openai(image_bytes)  
+        #Generate summaries for all images on a page and return a list per page.
+        image_summary_dict = {}
+
+        for page_num, img_bytes in images:
+            img_summary = generate_image_summary_openai(img_bytes)
+            image_summary_dict.setdefault(page_num, []).append(img_summary)
+
+        return image_summary_dict  # Each page now has a list of image summaries
+
     else:  
         raise ValueError("Invalid option selected for image summarization.")  
 
@@ -147,106 +164,120 @@ def get_embedding(text_to_embed):
     """Calls Azure OpenAI API to get embeddings for the input text."""
     try:
         client = AzureOpenAI(
-                api_key = os.getenv("AZURE_OPENAI_API_KEY"),  
-                api_version = "2024-06-01",
-                azure_endpoint =os.getenv("AZURE_OPENAI_ENDPOINT") 
-                )
+            api_key = os.getenv("credential"),  
+            api_version = "2024-06-01",
+            azure_endpoint =os.getenv("open_ai_endpoint") 
+        )
 
         response = client.embeddings.create(
             input = text_to_embed,
-            model= os.getenv("AZURE_OPENAI_EMBEDDING")
+            model= os.getenv("open_ai_model_name")
         )
 
         return response.data[0].embedding
     except Exception as e:
         print(f"Error fetching embedding: {e}")
+        return None
 
-def chunk_text(text, max_chunk_size=MAX_CHUNK_SIZE):  
-    words = text.split()  
+def chunk_text_with_image(text_content, image_summaries, max_chunk_size=MAX_CHUNK_SIZE):  
     chunks = []
-    embeddings = []  
-    current_chunk = ""  
-  
-    for word in words:  
-        if len(current_chunk) + len(word) + 1 > max_chunk_size:  
-            chunks.append(current_chunk)  
-            current_chunk = word  
-        else:  
-            if current_chunk:  
-                current_chunk += " " + word  
-            else:  
-                current_chunk = word  
-  
-    if current_chunk:  
-        chunks.append(current_chunk)
-        embeddings.append(get_embedding(current_chunk))  
-  
-    return chunks, embeddings
+    
+    for page_idx, page_text in text_content.items():  # Ensure correct iteration
+        words = page_text.split()
+        current_chunk = ""
+        chunk_list = []
 
-# ----------------------- Step 6: Upload Documents to Search Index -----------------------  
-  
-def upload_documents_to_search(chunks, image_summaries, embeddings,other_metadata):  
+        for word in words:
+            if len(current_chunk) + len(word) + 1 > max_chunk_size:
+                chunk_list.append(current_chunk)
+                current_chunk = word
+            else:
+                current_chunk += " " + word if current_chunk else word
+
+        if current_chunk:
+            chunk_list.append(current_chunk)
+
+        # Get all image summaries for the page and Get embedding for the combined image summaries (only if summary exists)
+        image_summary = " ".join(image_summaries.get(page_idx, []))
+        image_summary_embedding = get_embedding(image_summary) if image_summary else None
+
+        for chunk in chunk_list:
+            chunks.append({
+                "chunk": chunk,
+                "chunk_embedding": get_embedding(chunk),
+                "combine_content": f"{chunk} {image_summary}".strip(),
+                "image_summary": image_summary,
+                "image_summary_embedding": image_summary_embedding
+            })
+
+    return chunks
+
+# ----------------------- Step 6: Return metadata ----------------------- 
+def extract_metadata(pdf_bytes):
+
+    # Create a BlobClient using the SAS URL
+    blob_client = BlobClient.from_blob_url(pdf_bytes)
+
+    # Get metadata from the blob
+    return blob_client.get_blob_properties().metadata
+
+
+# ----------------------- Step 7: Upload Documents to Search Index -----------------------  
+def valid_document_key(document_key):
+    return re.sub(r'[^a-zA-Z0-9_-]', '', document_key)
+
+def upload_documents_to_search(chunks, metadata):  
     search_client = SearchClient(  
-        endpoint=SEARCH_SERVICE_ENDPOINT,  
-        index_name=SEARCH_INDEX_NAME,  
-        credential=AzureKeyCredential(SEARCH_API_KEY)  
+        endpoint=os.getenv('azure_search_service_endpoint'),  
+        index_name=os.getenv('search_index_name'),  
+        credential=AzureKeyCredential(os.getenv('azure_search_api_key'))  
     )  
-  
-    documents = []  
-    for idx, chunk in enumerate(chunks):  
-        doc = {  
-            "id": idx,  
-            "content": chunk,  
-            "content_vector": embeddings[idx] if idx < len(embeddings) else "",
-            "image_summary": image_summaries[idx] if idx < len(image_summaries) else ""  
-        }  
-        documents.append(doc)  
-  
-    result = search_client.upload_documents(documents)  
-    print(f"Uploaded {len(result)} documents to the search index.")  
+
+
+    documents = []
+
+    for chunk_id, chunk in enumerate(chunks):
+        doc = {
+            "parent_id": metadata.get("metadata_file_name", "unknown"),
+            "title": metadata.get("metadata_file_name", "unknown"),
+            # Clean the document key to ensure it's valid
+            "chunk_id": valid_document_key(f"page-{metadata['metadata_file_name']}-{chunk_id}"),
+            "chunk": chunk["chunk"],
+            "combined_content": chunk["combine_content"],
+            "text_vector": chunk["chunk_embedding"],
+            "file_path": metadata.get("metadata_storage_path", ""),
+            "video_path": metadata.get("metadata_video_path", ""),
+            "image_summaries": chunk["image_summary"],
+            "image_summary_embedding": chunk["image_summary_embedding"],
+            "has_image": bool(chunk["image_summary"])
+        }
+        documents.append(doc)
+
+    search_client.upload_documents(documents)
+    print(f"Uploaded {len(documents)} documents.")
 
 # ----------------------- Main Execution -----------------------  
-  
+
+
 def main():  
     # Step 1: Download PDF from Blob Storage  
-    print("Downloading PDF from Blob Storage...")  
-    pdf_bytes = get_blob_sas_url()#download_pdf_from_blob()  
-    print("PDF downloaded successfully.")  
-  
+    blob_url = get_blob_sas_url()
     # Step 2: Analyze PDF with Document Intelligence  
-    print("Analyzing PDF with Azure Document Intelligence...")  
-    analysis_result = analyze_pdf(pdf_bytes)  
-    print("PDF analysis completed.")  
-  
+    analysis_result = analyze_pdf(blob_url)  
     # Step 3: Extract Text and Images  
-    print("Extracting text and images from analysis result...")  
-    text, images = extract_content(analysis_result,pdf_bytes)  
-    print(f"Extracted {len(images)} images from the document.")  
-  
+    extracted_text, extracted_images = extract_content(analysis_result,blob_url)  
     # Step 4: Generate Image Summaries  
-    print("Generating summaries for extracted images using Azure Computer Vision...")  
-    image_summaries = []  
-    for idx, img_bytes in enumerate(images):  
-        if img_bytes:  
-            print(f"Processing image {idx + 1}/{len(images)}...")  
-            summary = generate_image_summary(img_bytes, option="azure_cv")  # Change option if needed  
-            image_summaries.append(summary)  
-        else:  
-            print(f"No image data available for image {idx + 1}.")  
-            image_summaries.append("")  
-  
-    print("Image summaries generated.") 
-  
+    image_summaries = generate_image_summaries(extracted_images)
     # Step 5: Chunk Text  
-    print("Chunking text for optimal indexing...")  
-    chunks = chunk_text(text)  
-    print(f"Text divided into {len(chunks)} chunks.")  
-  
-  
-    # # Step 6: Upload Documents to Search Index  
-    # print("Uploading documents to Azure Cognitive Search...")  
-    # upload_documents_to_search(chunks, image_summaries)  
-    # print("All documents uploaded successfully.")  
-  
+    chunk_info = chunk_text_with_image(extracted_text, image_summaries)  
+    # Step 6: get metadata
+    metadata = extract_metadata(blob_url)
+    print(metadata)
+    # Step 7: Upload Documents to Search Index  
+    upload_documents_to_search(chunk_info, metadata)
+
+
+
 if __name__ == "__main__":  
     main()  
+    #get_list_of_blob_names()
