@@ -24,7 +24,6 @@ BLOB_SAS_TOKEN = os.getenv("sas")
 
 BLOB_CONTAINER_NAME = os.getenv("container_name")  
 FOLDER_NAME = os.getenv("subfolder_name")
-PDF_BLOB_NAME = "1 Administration_1.14 Configure embargoes.pdf" 
   
 # Azure Document Intelligence Configuration  
 DOCUMENT_INTELLIGENCE_ENDPOINT = os.getenv("document_intelligence_endpoint")  
@@ -34,24 +33,32 @@ DOCUMENT_INTELLIGENCE_KEY = os.getenv("document_intelligence_key")
 SEARCH_SERVICE_ENDPOINT = os.getenv("azure_search_service_endpoint")  
 SEARCH_API_KEY = os.getenv("azure_search_api_key")  
 SEARCH_INDEX_NAME = os.getenv("search_index_name")
+
  
 # OpenAI Configuration (If using Option 1 or 3)  
-OPENAI_API_KEY = os.getenv("credential")  
+OPENAI_API_KEY = os.getenv("open_ai_credential")  
   
 # Chunking Configuration  
 MAX_CHUNK_SIZE = 1000  # Maximum number of characters per chunk  
+
+
+client = AzureOpenAI(
+    api_key = OPENAI_API_KEY,  
+    api_version = "2024-06-01",
+    azure_endpoint =os.getenv("open_ai_endpoint") 
+)
 
 
 # ----------------------- Step 0: listing files that are located in a data lake storage account -----------------------
 def get_list_of_blob_names():
     blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
     container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
-    blob_list = container_client.list_blobs(name_starts_with=FOLDER_NAME)
-    return [blob.name for blob in blob_list]
+    blob_list = container_client.list_blobs(name_starts_with=FOLDER_NAME+"/1")
+    return [blob.name for blob in blob_list if blob.name.endswith(".pdf")]
 
 # ----------------------- Step 1: Access PDF from Blob Storage -----------------------  
-def get_blob_sas_url():
-    blob_url_path = f"https://{BLOB_ACCOUNT_NAME}.blob.core.windows.net/{BLOB_CONTAINER_NAME}/{FOLDER_NAME}/{PDF_BLOB_NAME}"
+def get_blob_sas_url(c_file):
+    blob_url_path = f"https://{BLOB_ACCOUNT_NAME}.blob.core.windows.net/{BLOB_CONTAINER_NAME}/{c_file}"
     blob_sas_url_path = f"{blob_url_path}?{BLOB_SAS_TOKEN}"
     return blob_sas_url_path
 # def download_pdf_from_blob():  
@@ -122,11 +129,7 @@ def generate_image_summary_openai(image_bytes):
 
     user_prompt = f"Provide a detailed summary for the following image:"  ## Modify prompt as needed
     system_prompt = f"You are an AI assistant that summarizes images based on provided data." ## Modify prompt as needed
-    client = AzureOpenAI(
-        api_key = os.getenv("credential"),  
-        api_version = "2024-06-01",
-        azure_endpoint =os.getenv("open_ai_endpoint") 
-        )
+
     response = client.chat.completions.create(
         model=os.getenv("open_ai_model_gpt"),
         messages=[
@@ -163,11 +166,6 @@ def generate_image_summaries(images, option="openai"):
 def get_embedding(text_to_embed):
     """Calls Azure OpenAI API to get embeddings for the input text."""
     try:
-        client = AzureOpenAI(
-            api_key = os.getenv("credential"),  
-            api_version = "2024-06-01",
-            azure_endpoint =os.getenv("open_ai_endpoint") 
-        )
 
         response = client.embeddings.create(
             input = text_to_embed,
@@ -199,7 +197,7 @@ def chunk_text_with_image(text_content, image_summaries, max_chunk_size=MAX_CHUN
 
         # Get all image summaries for the page and Get embedding for the combined image summaries (only if summary exists)
         image_summary = " ".join(image_summaries.get(page_idx, []))
-        image_summary_embedding = get_embedding(image_summary) if image_summary else None
+        image_summary_embedding = get_embedding(image_summary) if image_summary else []
 
         for chunk in chunk_list:
             chunks.append({
@@ -213,10 +211,10 @@ def chunk_text_with_image(text_content, image_summaries, max_chunk_size=MAX_CHUN
     return chunks
 
 # ----------------------- Step 6: Return metadata ----------------------- 
-def extract_metadata(pdf_bytes):
+def extract_metadata(blob_url):
 
     # Create a BlobClient using the SAS URL
-    blob_client = BlobClient.from_blob_url(pdf_bytes)
+    blob_client = BlobClient.from_blob_url(blob_url)
 
     # Get metadata from the blob
     return blob_client.get_blob_properties().metadata
@@ -238,18 +236,33 @@ def upload_documents_to_search(chunks, metadata):
 
     for chunk_id, chunk in enumerate(chunks):
         doc = {
+            # "parent_id": metadata.get("metadata_file_name", "unknown"),
+            # "title": metadata.get("metadata_file_name", "unknown"),
+            # # Clean the document key to ensure it's valid
+            # "chunk_id": valid_document_key(f"page-{metadata['metadata_file_name']}-{chunk_id}"),
+            # "chunk": chunk["chunk"],
+            # "combined_content": chunk["combine_content"],
+            # "text_vector": chunk["chunk_embedding"],
+            # "file_path": metadata.get("metadata_pdf_path", ""),
+            # "video_path": metadata.get("metadata_video_path", ""),
+            # "image_summaries": chunk["image_summary"],
+            # "image_summary_embedding": chunk["image_summary_embedding"],
+            # "has_image": bool(chunk["image_summary"])
+
+            "chunk_id": valid_document_key(f"page-{metadata['metadata_file_name']}-{chunk_id}"),
             "parent_id": metadata.get("metadata_file_name", "unknown"),
             "title": metadata.get("metadata_file_name", "unknown"),
-            # Clean the document key to ensure it's valid
-            "chunk_id": valid_document_key(f"page-{metadata['metadata_file_name']}-{chunk_id}"),
+
             "chunk": chunk["chunk"],
-            "combined_content": chunk["combine_content"],
             "text_vector": chunk["chunk_embedding"],
-            "file_path": metadata.get("metadata_storage_path", ""),
-            "video_path": metadata.get("metadata_video_path", ""),
+
             "image_summaries": chunk["image_summary"],
             "image_summary_embedding": chunk["image_summary_embedding"],
-            "has_image": bool(chunk["image_summary"])
+
+            "combined_content": chunk["combine_content"],
+
+            "file_path": metadata.get("metadata_pdf_path", ""),
+            "video_path": metadata.get("metadata_video_path", "")
         }
         documents.append(doc)
 
@@ -259,25 +272,39 @@ def upload_documents_to_search(chunks, metadata):
 # ----------------------- Main Execution -----------------------  
 
 
-def main():  
-    # Step 1: Download PDF from Blob Storage  
-    blob_url = get_blob_sas_url()
+def main(blob_url):  
+
     # Step 2: Analyze PDF with Document Intelligence  
-    analysis_result = analyze_pdf(blob_url)  
+    analysis_result = analyze_pdf(blob_url)
+    #print("-----------------------------------------------2")
+    #print(analysis_result)  
     # Step 3: Extract Text and Images  
     extracted_text, extracted_images = extract_content(analysis_result,blob_url)  
+    #print(extracted_text, extracted_images)
+    #print("-----------------------------------------------3")
+    #print(extracted_text)
     # Step 4: Generate Image Summaries  
     image_summaries = generate_image_summaries(extracted_images)
+    #print("-----------------------------------------------4")
+    #print(image_summaries)
     # Step 5: Chunk Text  
     chunk_info = chunk_text_with_image(extracted_text, image_summaries)  
+    #print("-----------------------------------------------5")
+    #print(chunk_info)
     # Step 6: get metadata
     metadata = extract_metadata(blob_url)
-    print(metadata)
+    #print("-----------------------------------------------6")
+    #print(metadata)
     # Step 7: Upload Documents to Search Index  
+    #print("-----------------------------------------------7")
     upload_documents_to_search(chunk_info, metadata)
 
 
 
 if __name__ == "__main__":  
-    main()  
-    #get_list_of_blob_names()
+    file_list = get_list_of_blob_names()
+    for file in file_list:
+        print(f"Processing file: {file}")
+        #Step 1: Download PDF from Blob Storage  
+        blob_url = get_blob_sas_url(file)
+        main(blob_url)
